@@ -24,11 +24,11 @@ vad_model = silero_vad.load_silero_vad()
 
 
 def input_audio(
-    prompt: str | None = None,
+    prompt: typing.Optional[str] = None,
     *,
-    output_audio_filepath: pathlib.Path | str | None = None,
+    output_audio_filepath: typing.Optional[pathlib.Path | str] = None,
     verbose: bool = False,
-) -> pathlib.Path | bytes:
+) -> bytes:
     audio = pyaudio.PyAudio()
     vad_iterator = silero_vad.VADIterator(
         vad_model, threshold=VAD_THRESHOLD, sampling_rate=SAMPLE_RATE
@@ -72,6 +72,8 @@ def input_audio(
             # START
             if speech_dict and "start" in speech_dict:
                 if not speaking:
+                    if prompt is not None:
+                        print("🗣️", flush=True)
                     if verbose:
                         print(
                             "Speech start detected (sample index in stream: "
@@ -79,9 +81,6 @@ def input_audio(
                         )
                     speaking = True
                     current_speech_segment = []  # Clear buffer
-
-                if prompt is not None:
-                    print("🗣️", flush=True)
 
                 current_speech_segment.append(audio_float32)
 
@@ -114,19 +113,17 @@ def input_audio(
                         if verbose:
                             print(f"📁 Saved to {output_audio_filepath}")
 
-                        return output_audio_filepath
-
-                    else:
-                        # Save to bytes
-                        byte_io = io.BytesIO()
-                        torchaudio.save(
-                            byte_io,
-                            torch.from_numpy(full_speech_audio).unsqueeze(0),
-                            SAMPLE_RATE,
-                            bits_per_sample=16,
-                        )
-                        byte_io.seek(0)
-                        return byte_io.read()
+                    # Save to bytes
+                    byte_io = io.BytesIO()
+                    torchaudio.save(
+                        byte_io,
+                        torch.from_numpy(full_speech_audio).unsqueeze(0),
+                        SAMPLE_RATE,
+                        bits_per_sample=16,
+                        format="wav",
+                    )
+                    byte_io.seek(0)
+                    return byte_io.read()
 
                 speaking = False
                 current_speech_segment = []
