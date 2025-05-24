@@ -1,6 +1,10 @@
 [project]
 authors = [{ name = "Allen Chou", email = "f1470891079@gmail.com" }]
-dependencies = ["pyaudio (>=0.2,<0.3)", "silero-vad (>=5,<6)"]
+dependencies = [
+  "pyaudio (>=0.2,<0.3)",
+  "silero-vad (>=5,<6)",
+  "soundfile (>=0.13,<0.14)",
+]
 description = "Python input audio."
 license = { text = "MIT" }
 name = "input-audio"

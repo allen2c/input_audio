@@ -52,7 +52,7 @@ def input_audio(
         speaking = False
 
         if prompt is not None:
-            print(prompt, end="")
+            print(f"{prompt}: ", end="", flush=True)
 
         while True:
             audio_chunk_bytes: bytes = stream.read(
@@ -79,6 +79,9 @@ def input_audio(
                         )
                     speaking = True
                     current_speech_segment = []  # Clear buffer
+
+                if prompt is not None:
+                    print("🗣️", flush=True)
 
                 current_speech_segment.append(audio_float32)
 
