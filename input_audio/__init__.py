@@ -1,7 +1,9 @@
 import io
 import pathlib
 import typing
+from collections import deque
 
+import noisereduce as nr
 import numpy as np
 import pyaudio
 import silero_vad
@@ -24,6 +26,11 @@ POST_SPEECH_BUFFER_MS = 500  # Post-speech buffer 500ms
 PRE_SPEECH_FRAMES = int(PRE_SPEECH_BUFFER_MS * SAMPLE_RATE / 1000 / FRAME_SAMPLES)
 POST_SPEECH_FRAMES = int(POST_SPEECH_BUFFER_MS * SAMPLE_RATE / 1000 / FRAME_SAMPLES)
 
+# === Noise Reduction Parameters ===
+NOISE_REDUCTION_ENABLED = True  # Whether to apply noise reduction
+NOISE_REDUCTION_STATIONARY = True  # Use stationary noise reduction
+NOISE_REDUCTION_PROP_DECREASE = 0.8  # Proportion of noise to reduce (0.0-1.0)
+
 vad_model = silero_vad.load_silero_vad()
 
 
@@ -32,6 +39,8 @@ def input_audio(
     *,
     output_audio_filepath: typing.Optional[pathlib.Path | str] = None,
     verbose: bool = False,
+    enable_noise_reduction: bool = NOISE_REDUCTION_ENABLED,
+    noise_reduction_strength: float = NOISE_REDUCTION_PROP_DECREASE,
 ) -> bytes:
     audio = pyaudio.PyAudio()
     vad_iterator = silero_vad.VADIterator(
@@ -52,9 +61,6 @@ def input_audio(
     )
 
     try:
-        # Use a circular buffer to maintain a continuous audio stream
-        from collections import deque
-
         audio_buffer = deque(maxlen=PRE_SPEECH_FRAMES)  # Pre-speech buffer
         current_speech_segment: typing.List[NDArray[np.float32]] = []
         post_speech_counter = 0
@@ -151,6 +157,30 @@ def input_audio(
                                     # Fade-out
                                     fade_out = np.linspace(1, 0, fade_samples)
                                     full_speech_audio[-fade_samples:] *= fade_out
+
+                                # 4. Apply noise reduction if enabled
+                                if enable_noise_reduction:
+                                    if verbose:
+                                        print("🔇 Applying noise reduction...")
+
+                                    try:
+                                        # Apply noise reduction using spectral gating
+                                        full_speech_audio = nr.reduce_noise(
+                                            y=full_speech_audio,
+                                            sr=SAMPLE_RATE,
+                                            stationary=NOISE_REDUCTION_STATIONARY,
+                                            prop_decrease=noise_reduction_strength,
+                                            n_std_thresh_stationary=1.5,  # Conservative
+                                            n_fft=1024,  # Optimized for speech
+                                        )
+                                        if verbose:
+                                            print(
+                                                "✅ Noise reduction applied successfully"
+                                            )
+                                    except Exception as e:
+                                        if verbose:
+                                            print(f"⚠️  Noise reduction failed: {e}")
+                                        # Continue without noise reduction if it fails
 
                                 print(
                                     "🎙️ Processed speech segment of "
