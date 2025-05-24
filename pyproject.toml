@@ -11,10 +11,16 @@ license = { text = "MIT" }
 name = "input-audio"
 readme = "README.md"
 requires-python = ">=3.11,<4"
-version = "0.0.1"
+version = "0.1.0"
+
+[project.urls]
+homepage = "https://github.com/allen2c/input_audio"
+repository = "https://github.com/allen2c/input_audio"
+
 
 [tool.poetry.group.dev.dependencies]
 black = "*"
+codepress = ">=0.2"
 isort = "*"
 poetry-plugin-export = "^1.9.0"
 
