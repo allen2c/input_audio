@@ -88,6 +88,14 @@ def input_audio(
         current_speech_segment: typing.List[NDArray[np.float32]] = []
         post_speech_counter = 0
         speaking = False
+        # Rolling working buffer in float32 (raw/original) for NR context
+        working_buffer_float32: NDArray[np.float32] = np.array([], dtype=np.float32)
+        max_working_frames: int = audio_config.working_audio_buffer_frames
+        # Periodic NR control and write tracking
+        nr_interval_ms: int = 500
+        elapsed_since_last_nr_ms: int = 0
+        total_frames_read: int = 0
+        total_frames_written: int = 0
 
         while True:
             raw_audio_chunk_bytes: bytes = stream.read(
@@ -99,6 +107,8 @@ def input_audio(
             )
             chunk_ms = int(frames_in_chunk * 1000 / audio_config.sample_rate)
             current_recording_duration_ms += chunk_ms
+            elapsed_since_last_nr_ms += chunk_ms
+            total_frames_read += frames_in_chunk
 
             # To numpy array
             audio_int16: NDArray[np.int16] = np.frombuffer(
@@ -111,9 +121,6 @@ def input_audio(
             )
             # Ensure the range is between [-1, 1]
             audio_float32 = np.clip(audio_float32, -1.0, 1.0)
-
-            if wave_file:
-                wave_file.writeframes(raw_audio_chunk_bytes)
 
             # Stop conditions
             if stop_event and stop_event.is_set():
@@ -129,6 +136,55 @@ def input_audio(
                         flush=True,
                     )
                 break
+
+            # Update working buffer (float32, raw/original) and trim to max context
+            if enable_noise_reduction:
+                if working_buffer_float32.size == 0:
+                    working_buffer_float32 = audio_float32.copy()
+                else:
+                    working_buffer_float32 = np.concatenate(
+                        (working_buffer_float32, audio_float32)
+                    )
+                if working_buffer_float32.size > max_working_frames:
+                    working_buffer_float32 = working_buffer_float32[
+                        -max_working_frames:
+                    ]
+
+                # Periodically apply NR and write only the new tail once
+                if wave_file and elapsed_since_last_nr_ms >= nr_interval_ms:
+                    try:
+                        processed_working_buffer = nr.reduce_noise(
+                            y=working_buffer_float32,
+                            sr=audio_config.sample_rate,
+                            stationary=noise_reduction_config.stationary,
+                            prop_decrease=noise_reduction_config.prop_decrease,
+                            n_std_thresh_stationary=(
+                                noise_reduction_config.n_std_thresh_stationary
+                            ),
+                            n_fft=noise_reduction_config.n_fft,
+                        )
+                    except Exception as e:
+                        if verbose:
+                            print(f"⚠️  Noise reduction failed on working buffer: {e}")
+                        processed_working_buffer = working_buffer_float32
+
+                    # Determine frames to write since last write (avoid re-writing)
+                    unread_frames = total_frames_read - total_frames_written
+                    frames_to_write = min(unread_frames, processed_working_buffer.size)
+                    if frames_to_write > 0:
+                        processed_chunk = processed_working_buffer[-frames_to_write:]
+                        # Convert float32 [-1,1] to int16 bytes for WAV write
+                        chunk_int16 = np.clip(
+                            processed_chunk * 32767.0, -32768, 32767
+                        ).astype(np.int16)
+                        wave_file.writeframes(chunk_int16.tobytes())
+                        total_frames_written += frames_to_write
+                    elapsed_since_last_nr_ms = 0
+            else:
+                # If noise reduction disabled, write raw chunk directly
+                if wave_file:
+                    wave_file.writeframes(raw_audio_chunk_bytes)
+                    total_frames_written += frames_in_chunk
 
             # To tensor
             audio_tensor = torch.from_numpy(audio_float32)
@@ -242,8 +298,9 @@ def input_audio(
 
                                 stream.stop_stream()
 
-                                # Save the detected speech
-                                if output_audio_filepath is not None:
+                                # Save the detected speech only if we are not already
+                                # writing a streaming WAV file
+                                if output_audio_filepath is not None and not wave_file:
                                     silero_vad.save_audio(
                                         path=str(output_audio_filepath),
                                         tensor=torch.from_numpy(full_speech_audio),
