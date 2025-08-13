@@ -1,7 +1,8 @@
 """
-Real-time recording audio into file if provided.
-If enable VAD, it will save detected speech segments into speech segments queue and files if provided.
-"""  # noqa: E501
+Record microphone audio to a WAV file in real time.
+Optionally run VAD to emit speech segments and noise reduction for cleaner audio.
+Simple API; streaming write with periodic processing.
+"""
 
 import io
 import pathlib
@@ -70,11 +71,7 @@ def input_audio(
     audio = pyaudio.PyAudio()
 
     # Open Wave File
-    output_audio_filepath.parent.mkdir(parents=True, exist_ok=True)
-    wave_file = wave.open(str(output_audio_filepath), "wb")
-    wave_file.setnchannels(audio_config.channels)
-    wave_file.setsampwidth(audio.get_sample_size(audio_config.format))
-    wave_file.setframerate(audio_config.sample_rate)
+    wave_file = open_wave_file(output_audio_filepath, audio_config, audio)
 
     vad_iterator: typing.Optional[silero_vad.VADIterator] = None
     if enable_vad:
@@ -123,11 +120,10 @@ def input_audio(
             elapsed_since_last_audio_processing_ms += chunk_ms
             total_frames_read += frames_in_chunk
 
-            # To numpy array
+            # To numpy array and normalize
             audio_chunk_int16: NDArray[np.int16] = np.frombuffer(
                 raw_audio_chunk_bytes, np.int16
             )
-            # More precise normalization to avoid clipping
             audio_chunk_float32 = to_normalized_npfloat32(audio_chunk_int16)
 
             # Stop conditions
@@ -135,55 +131,31 @@ def input_audio(
                 break
 
             # Append current chunk to rolling buffer
-            rolling_working_buffer_float32 = np.concatenate(
-                (rolling_working_buffer_float32, audio_chunk_float32)
+            rolling_working_buffer_float32 = append_and_trim_rolling_buffer(
+                rolling_working_buffer_float32,
+                audio_chunk_float32,
+                max_frames=max_rolling_working_buffer_frames,
             )
-            if rolling_working_buffer_float32.size > max_rolling_working_buffer_frames:
-                rolling_working_buffer_float32 = rolling_working_buffer_float32[
-                    -max_rolling_working_buffer_frames:
-                ]
 
             # Update working buffer (float32, raw/original) and trim to max context
             should_flush = (
                 elapsed_since_last_audio_processing_ms >= audio_config.batch_process_ms
             )
             if should_flush:
-                if enable_noise_reduction:
-                    # Periodically apply NR and write only the new tail once
-                    try:
-                        _processed_working_buffer = nr.reduce_noise(
-                            y=rolling_working_buffer_float32,
-                            sr=audio_config.sample_rate,
-                            stationary=noise_reduction_config.stationary,
-                            prop_decrease=noise_reduction_config.prop_decrease,
-                            n_std_thresh_stationary=(
-                                noise_reduction_config.n_std_thresh_stationary
-                            ),
-                            n_fft=noise_reduction_config.n_fft,
-                        )
-                    except Exception as e:
-                        print(f"⚠️  Noise reduction failed on working buffer: {e}")
-                        _processed_working_buffer = rolling_working_buffer_float32
-                else:
-                    _processed_working_buffer = rolling_working_buffer_float32
-
-                # Determine frames to write since last write (avoid re-writing)
-                _unread_frames = total_frames_read - total_frames_written
-                _frames_to_write = min(_unread_frames, _processed_working_buffer.size)
-                if _frames_to_write > 0:
-                    _processed_chunk = _processed_working_buffer[-_frames_to_write:]
-                    # Optional output gain (streaming path)
-                    if audio_config.gain_db != 0.0:
-                        _gain = np.power(
-                            10.0, audio_config.gain_db / 20.0, dtype=np.float32
-                        )
-                        _processed_chunk = np.clip(_processed_chunk * _gain, -1.0, 1.0)
-                    # Convert float32 [-1,1] to int16 bytes for WAV write
-                    _chunk_int16 = np.clip(
-                        _processed_chunk * 32767.0, -32768, 32767
-                    ).astype(np.int16)
-                    wave_file.writeframes(_chunk_int16.tobytes())
-                    total_frames_written += _frames_to_write
+                processed_buffer = maybe_reduce_noise(
+                    rolling_working_buffer_float32,
+                    enable=enable_noise_reduction,
+                    cfg=noise_reduction_config,
+                    sample_rate=audio_config.sample_rate,
+                    verbose=verbose,
+                )
+                total_frames_written = write_tail_wav_since_last_write(
+                    processed_buffer,
+                    total_frames_read=total_frames_read,
+                    total_frames_written=total_frames_written,
+                    wave_file=wave_file,
+                    gain_db=audio_config.gain_db,
+                )
                 elapsed_since_last_audio_processing_ms = 0
 
             # To tensor
@@ -253,72 +225,19 @@ def input_audio(
                         if post_speech_counter > vad_config.post_speech_frames:
                             # Speech ended, process full audio
                             if current_speech_segment:
-                                full_speech_audio = np.concatenate(
-                                    current_speech_segment
+                                finalize_and_emit_vad_segment(
+                                    segment_chunks=current_speech_segment,
+                                    audio_config=audio_config,
+                                    enable_noise_reduction=enable_noise_reduction,
+                                    noise_reduction_config=noise_reduction_config,
+                                    speech_start_ms=speech_start_ms,
+                                    cur_dur_ms=cur_dur,
+                                    vad_segments_queue=vad_segments_queue,
+                                    vad_dirpath=typing.cast(
+                                        typing.Optional[pathlib.Path], vad_dirpath
+                                    ),
+                                    verbose=verbose,
                                 )
-                                # Apply fade-in and fade-out (to prevent pops)
-                                fade_samples = min(
-                                    int(0.01 * audio_config.sample_rate),
-                                    len(full_speech_audio) // 10,
-                                )
-                                if fade_samples > 0:
-                                    # Fade-in
-                                    fade_in = np.linspace(0, 1, fade_samples)
-                                    full_speech_audio[:fade_samples] *= fade_in
-
-                                    # Fade-out
-                                    fade_out = np.linspace(1, 0, fade_samples)
-                                    full_speech_audio[-fade_samples:] *= fade_out
-
-                                # Apply noise reduction if enabled
-                                if enable_noise_reduction:
-                                    if verbose:
-                                        print("🔇 Applying noise reduction...")
-
-                                    try:
-                                        full_speech_audio = nr.reduce_noise(
-                                            y=full_speech_audio,
-                                            sr=audio_config.sample_rate,
-                                            stationary=noise_reduction_config.stationary,  # noqa: E501
-                                            prop_decrease=noise_reduction_config.prop_decrease,  # noqa: E501
-                                            n_std_thresh_stationary=noise_reduction_config.n_std_thresh_stationary,  # noqa: E501
-                                            n_fft=noise_reduction_config.n_fft,
-                                        )
-                                        if verbose:
-                                            print(
-                                                "✅ Noise reduction applied successfully"
-                                            )
-                                    except Exception as e:
-                                        if verbose:
-                                            print(f"⚠️  Noise reduction failed: {e}")
-                                        # Continue without noise reduction if it fails
-                                # Package segment as DataURL and enqueue if provided
-                                end_ms = cur_dur
-                                byte_io = io.BytesIO()
-                                torchaudio.save(
-                                    byte_io,
-                                    torch.from_numpy(full_speech_audio).unsqueeze(0),
-                                    audio_config.sample_rate,
-                                    bits_per_sample=16,
-                                    format="wav",
-                                )
-                                wav_bytes = byte_io.getvalue()
-                                audio_url = durl.DataURL.from_data(
-                                    durl.MIMEType.WAVEFORM_AUDIO_FORMAT, wav_bytes
-                                )
-                                if vad_segments_queue is not None:
-                                    vad_segments_queue.put(
-                                        VADSegment(
-                                            start_ms=int(speech_start_ms),
-                                            end_ms=int(end_ms),
-                                            audio_url=audio_url,
-                                        )
-                                    )
-                                if vad_dirpath:
-                                    vad_dirpath.joinpath(
-                                        f"{speech_start_ms}-{end_ms}.wav"
-                                    ).write_bytes(wav_bytes)
-
                             speaking = False
                             current_speech_segment = []
                             post_speech_counter = 0
@@ -345,69 +264,17 @@ def input_audio(
         if "audio" in locals():
             audio.terminate()
         if speaking and current_speech_segment:
-            # End of speaking, process full audio
-            full_speech_audio = np.concatenate(current_speech_segment)
-            # Apply fade-in and fade-out (to prevent pops)
-            fade_samples = min(
-                int(0.01 * audio_config.sample_rate),
-                len(full_speech_audio) // 10,
+            finalize_and_emit_vad_segment(
+                segment_chunks=current_speech_segment,
+                audio_config=audio_config,
+                enable_noise_reduction=enable_noise_reduction,
+                noise_reduction_config=noise_reduction_config,
+                speech_start_ms=speech_start_ms,
+                cur_dur_ms=cur_dur,
+                vad_segments_queue=vad_segments_queue,
+                vad_dirpath=typing.cast(typing.Optional[pathlib.Path], vad_dirpath),
+                verbose=verbose,
             )
-            if fade_samples > 0:
-                # Fade-in
-                fade_in = np.linspace(0, 1, fade_samples)
-                full_speech_audio[:fade_samples] *= fade_in
-
-                # Fade-out
-                fade_out = np.linspace(1, 0, fade_samples)
-                full_speech_audio[-fade_samples:] *= fade_out
-
-            # Apply noise reduction if enabled
-            if enable_noise_reduction:
-                if verbose:
-                    print("🔇 Applying noise reduction...")
-
-                try:
-                    full_speech_audio = nr.reduce_noise(
-                        y=full_speech_audio,
-                        sr=audio_config.sample_rate,
-                        stationary=noise_reduction_config.stationary,  # noqa: E501
-                        prop_decrease=noise_reduction_config.prop_decrease,  # noqa: E501
-                        n_std_thresh_stationary=noise_reduction_config.n_std_thresh_stationary,  # noqa: E501
-                        n_fft=noise_reduction_config.n_fft,
-                    )
-                    if verbose:
-                        print("✅ Noise reduction applied successfully")
-                except Exception as e:
-                    if verbose:
-                        print(f"⚠️  Noise reduction failed: {e}")
-                    # Continue without noise reduction if it fails
-            # Package segment as DataURL and enqueue if provided
-            end_ms = cur_dur
-            byte_io = io.BytesIO()
-            torchaudio.save(
-                byte_io,
-                torch.from_numpy(full_speech_audio).unsqueeze(0),
-                audio_config.sample_rate,
-                bits_per_sample=16,
-                format="wav",
-            )
-            wav_bytes = byte_io.getvalue()
-            audio_url = durl.DataURL.from_data(
-                durl.MIMEType.WAVEFORM_AUDIO_FORMAT, wav_bytes
-            )
-            if vad_segments_queue is not None:
-                vad_segments_queue.put(
-                    VADSegment(
-                        start_ms=int(speech_start_ms),
-                        end_ms=int(end_ms),
-                        audio_url=audio_url,
-                    )
-                )
-            if vad_dirpath:
-                vad_dirpath.joinpath(f"{speech_start_ms}-{end_ms}.wav").write_bytes(
-                    wav_bytes
-                )
-
             speaking = False
             current_speech_segment = []
             post_speech_counter = 0
@@ -420,40 +287,22 @@ def input_audio(
 
         # Final flush for any unwritten data
         try:
-            _unread_frames = total_frames_read - total_frames_written
-            if _unread_frames > 0:
-                if enable_noise_reduction:
-                    try:
-                        _processed_working_buffer = nr.reduce_noise(
-                            y=rolling_working_buffer_float32,
-                            sr=audio_config.sample_rate,
-                            stationary=noise_reduction_config.stationary,
-                            prop_decrease=noise_reduction_config.prop_decrease,
-                            n_std_thresh_stationary=(
-                                noise_reduction_config.n_std_thresh_stationary
-                            ),
-                            n_fft=noise_reduction_config.n_fft,
-                        )
-                    except Exception:
-                        _processed_working_buffer = rolling_working_buffer_float32
-
-                else:
-                    _processed_working_buffer = rolling_working_buffer_float32
-
-                _frames_to_write = min(_unread_frames, _processed_working_buffer.size)
-                if _frames_to_write > 0:
-                    _processed_chunk = _processed_working_buffer[-_frames_to_write:]
-                    # Optional output gain (final flush)
-                    if audio_config.gain_db != 0.0:
-                        _gain = np.power(
-                            10.0, audio_config.gain_db / 20.0, dtype=np.float32
-                        )
-                        _processed_chunk = np.clip(_processed_chunk * _gain, -1.0, 1.0)
-                    _chunk_int16 = np.clip(
-                        _processed_chunk * 32767.0, -32768, 32767
-                    ).astype(np.int16)
-                    wave_file.writeframes(_chunk_int16.tobytes())
-                    total_frames_written += _frames_to_write
+            unread_frames = total_frames_read - total_frames_written
+            if unread_frames > 0:
+                processed = maybe_reduce_noise(
+                    rolling_working_buffer_float32,
+                    enable=enable_noise_reduction,
+                    cfg=noise_reduction_config,
+                    sample_rate=audio_config.sample_rate,
+                    verbose=False,
+                )
+                total_frames_written = write_tail_wav_since_last_write(
+                    processed,
+                    total_frames_read=total_frames_read,
+                    total_frames_written=total_frames_written,
+                    wave_file=wave_file,
+                    gain_db=audio_config.gain_db,
+                )
 
         finally:
             wave_file.close()
@@ -552,3 +401,197 @@ def is_max_dur_reached(
             )
         return True
     return False
+
+
+def open_wave_file(
+    output_audio_filepath: pathlib.Path,
+    audio_config: "AudioConfig",
+    audio: pyaudio.PyAudio,
+) -> wave.Wave_write:
+    """Open a WAV file writer configured by audio_config."""
+    output_audio_filepath.parent.mkdir(parents=True, exist_ok=True)
+    wf = wave.open(str(output_audio_filepath), "wb")
+    wf.setnchannels(audio_config.channels)
+    wf.setsampwidth(audio.get_sample_size(audio_config.format))
+    wf.setframerate(audio_config.sample_rate)
+    return wf
+
+
+def append_and_trim_rolling_buffer(
+    rolling_buffer: NDArray[np.float32],
+    new_chunk: NDArray[np.float32],
+    *,
+    max_frames: int,
+) -> NDArray[np.float32]:
+    """Append chunk and trim to max_frames from the end."""
+    if rolling_buffer.size == 0:
+        merged = new_chunk
+    else:
+        merged = np.concatenate((rolling_buffer, new_chunk))
+    if merged.size > max_frames:
+        return merged[-max_frames:]
+    return merged
+
+
+def maybe_reduce_noise(
+    samples: NDArray[np.float32],
+    *,
+    enable: bool,
+    cfg: "NoiseReductionConfig",
+    sample_rate: int,
+    verbose: bool = False,
+) -> NDArray[np.float32]:
+    """Apply noise reduction if enabled; fall back on any error."""
+    if not enable:
+        return samples
+    try:
+        return typing.cast(
+            NDArray[np.float32],
+            nr.reduce_noise(
+                y=samples,
+                sr=sample_rate,
+                stationary=cfg.stationary,
+                prop_decrease=cfg.prop_decrease,
+                n_std_thresh_stationary=cfg.n_std_thresh_stationary,
+                n_fft=cfg.n_fft,
+            ),
+        )
+    except Exception as e:  # noqa: BLE001
+        if verbose:
+            print(f"⚠️  Noise reduction failed: {e}")
+        return samples
+
+
+def apply_output_gain(
+    samples: NDArray[np.float32], *, gain_db: float
+) -> NDArray[np.float32]:
+    """Apply linear gain in-place-safe manner (returns new array)."""
+    if gain_db == 0.0:
+        return samples
+    gain = np.power(10.0, gain_db / 20.0, dtype=np.float32)
+    return np.clip(samples * typing.cast(np.float32, gain), -1.0, 1.0)
+
+
+def float32_to_int16_bytes(samples: NDArray[np.float32]) -> bytes:
+    """Convert normalized float32 [-1,1] to int16 bytes."""
+    int16 = np.clip(samples * 32767.0, -32768, 32767).astype(np.int16)
+    return int16.tobytes()
+
+
+def write_tail_wav_since_last_write(
+    processed_working_buffer: NDArray[np.float32],
+    *,
+    total_frames_read: int,
+    total_frames_written: int,
+    wave_file: wave.Wave_write,
+    gain_db: float,
+) -> int:
+    """Write only the unread tail frames and return updated total_frames_written."""
+    unread_frames = total_frames_read - total_frames_written
+    frames_to_write = min(unread_frames, processed_working_buffer.size)
+    if frames_to_write <= 0:
+        return total_frames_written
+    chunk = processed_working_buffer[-frames_to_write:]
+    if gain_db != 0.0:
+        chunk = apply_output_gain(chunk, gain_db=gain_db)
+    wave_file.writeframes(float32_to_int16_bytes(chunk))
+    return total_frames_written + frames_to_write
+
+
+def apply_fade_in_out(
+    samples: NDArray[np.float32], *, sample_rate: int
+) -> NDArray[np.float32]:
+    """Apply short fade-in and fade-out to avoid pops."""
+    if samples.size == 0:
+        return samples
+    fade_samples = min(int(0.01 * sample_rate), max(1, samples.size // 10))
+    if fade_samples <= 0:
+        return samples
+    out = samples.copy()
+    fade_in = np.linspace(0, 1, fade_samples)
+    out[:fade_samples] *= fade_in
+    fade_out = np.linspace(1, 0, fade_samples)
+    out[-fade_samples:] *= fade_out
+    return out
+
+
+def vad_segment_to_bytes_and_url(
+    segment: NDArray[np.float32], *, sample_rate: int
+) -> tuple[bytes, durl.DataURL]:
+    """Encode float32 mono PCM to WAV bytes and return data URL."""
+    byte_io = io.BytesIO()
+    torchaudio.save(
+        byte_io,
+        torch.from_numpy(segment).unsqueeze(0),
+        sample_rate,
+        bits_per_sample=16,
+        format="wav",
+    )
+    wav_bytes = byte_io.getvalue()
+    audio_url = durl.DataURL.from_data(durl.MIMEType.WAVEFORM_AUDIO_FORMAT, wav_bytes)
+
+    return (wav_bytes, audio_url)
+
+
+def emit_vad_segment_outputs(
+    *,
+    segment: NDArray[np.float32],
+    sample_rate: int,
+    speech_start_ms: int,
+    end_ms: int,
+    vad_segments_queue: typing.Optional[queue.Queue["VADSegment"]],
+    vad_dirpath: typing.Optional[pathlib.Path],
+) -> None:
+    """Emit outputs for a finalized speech segment (queue and/or file)."""
+    wav_bytes, audio_url = vad_segment_to_bytes_and_url(
+        segment, sample_rate=sample_rate
+    )
+    if vad_segments_queue is not None:
+        vad_segments_queue.put(
+            VADSegment(
+                start_ms=int(speech_start_ms),
+                end_ms=int(end_ms),
+                audio_url=audio_url,
+            )
+        )
+    if vad_dirpath is not None:
+        vad_dirpath.joinpath(f"{speech_start_ms}-{end_ms}.wav").write_bytes(wav_bytes)
+
+    return None
+
+
+def finalize_and_emit_vad_segment(
+    *,
+    segment_chunks: list[NDArray[np.float32]],
+    audio_config: "AudioConfig",
+    enable_noise_reduction: bool,
+    noise_reduction_config: "NoiseReductionConfig",
+    speech_start_ms: int,
+    cur_dur_ms: int,
+    vad_segments_queue: typing.Optional[queue.Queue["VADSegment"]],
+    vad_dirpath: typing.Optional[pathlib.Path],
+    verbose: bool,
+) -> None:
+    """Concatenate, fade, maybe NR, then emit queue/file outputs."""
+    if not segment_chunks:
+        return
+    full = np.concatenate(segment_chunks)
+    full = apply_fade_in_out(full, sample_rate=audio_config.sample_rate)
+    full = apply_output_gain(full, gain_db=audio_config.gain_db)
+    full = maybe_reduce_noise(
+        full,
+        enable=enable_noise_reduction,
+        cfg=noise_reduction_config,
+        sample_rate=audio_config.sample_rate,
+        verbose=verbose,
+    )
+    emit_vad_segment_outputs(
+        segment=full,
+        sample_rate=audio_config.sample_rate,
+        speech_start_ms=speech_start_ms,
+        end_ms=cur_dur_ms,
+        vad_segments_queue=vad_segments_queue,
+        vad_dirpath=vad_dirpath,
+    )
+
+    return None
