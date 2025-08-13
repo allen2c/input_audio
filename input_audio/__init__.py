@@ -1,3 +1,8 @@
+"""
+Real-time recording audio into file if provided.
+If enable VAD, it will save detected speech segments into speech segments queue and files if provided.
+"""  # noqa: E501
+
 import io
 import pathlib
 import typing
@@ -6,6 +11,7 @@ from collections import deque
 import noisereduce as nr
 import numpy as np
 import pyaudio
+import pydantic
 import silero_vad
 import torch
 import torchaudio
@@ -14,64 +20,64 @@ from numpy.typing import NDArray
 __version__ = pathlib.Path(__file__).parent.joinpath("VERSION").read_text().strip()
 
 
-# === VAD Parameters and Setup===
-FORMAT = pyaudio.paInt16
-CHANNELS = 1
-SAMPLE_RATE = 16000
-CHUNK_DURATION_MS = 30
-FRAME_SAMPLES = 512
-VAD_THRESHOLD = 0.5
-PRE_SPEECH_BUFFER_MS = 300  # Pre-speech buffer 300ms
-POST_SPEECH_BUFFER_MS = 500  # Post-speech buffer 500ms
-PRE_SPEECH_FRAMES = int(PRE_SPEECH_BUFFER_MS * SAMPLE_RATE / 1000 / FRAME_SAMPLES)
-POST_SPEECH_FRAMES = int(POST_SPEECH_BUFFER_MS * SAMPLE_RATE / 1000 / FRAME_SAMPLES)
-
-# === Noise Reduction Parameters ===
-NOISE_REDUCTION_ENABLED = True  # Whether to apply noise reduction
-NOISE_REDUCTION_STATIONARY = True  # Use stationary noise reduction
-NOISE_REDUCTION_PROP_DECREASE = 0.8  # Proportion of noise to reduce (0.0-1.0)
-
-vad_model = silero_vad.load_silero_vad()
-
-
 def input_audio(
-    prompt: typing.Optional[str] = None,
-    *,
     output_audio_filepath: typing.Optional[pathlib.Path | str] = None,
+    *,
+    audio_config: typing.Optional["AudioConfig"] = None,
+    enable_vad: bool = False,
+    vad_config: typing.Optional["VADConfig"] = None,
+    vad_model: typing.Optional[torch.nn.Module] = None,
+    enable_noise_reduction: bool = False,
+    noise_reduction_config: typing.Optional["NoiseReductionConfig"] = None,
     verbose: bool = False,
-    enable_noise_reduction: bool = NOISE_REDUCTION_ENABLED,
-    noise_reduction_strength: float = NOISE_REDUCTION_PROP_DECREASE,
 ) -> bytes:
-    audio = pyaudio.PyAudio()
-    vad_iterator = silero_vad.VADIterator(
-        vad_model, threshold=VAD_THRESHOLD, sampling_rate=SAMPLE_RATE
-    )
-
-    stream = audio.open(
-        format=FORMAT,
-        channels=CHANNELS,
-        rate=SAMPLE_RATE,
-        input=True,
-        frames_per_buffer=FRAME_SAMPLES,
-    )
     output_audio_filepath = (
         pathlib.Path(output_audio_filepath)
         if output_audio_filepath is not None
         else None
     )
+    audio_config = audio_config or AudioConfig()
+    vad_config = vad_config or VADConfig()
+    noise_reduction_config = noise_reduction_config or NoiseReductionConfig()
+
+    if (
+        audio_config.sample_rate != vad_config.sampling_rate
+        or audio_config.sample_rate != noise_reduction_config.sample_rate
+    ):
+        raise ValueError(
+            "Audio config sample rate must be the same as VAD config sample rate "
+            + "and noise reduction config sample rate, "
+            + f"but got {audio_config.sample_rate}, {vad_config.sampling_rate}, "
+            + f"{noise_reduction_config.sample_rate}"
+        )
+
+    audio = pyaudio.PyAudio()
+
+    vad_iterator: typing.Optional[silero_vad.VADIterator] = None
+    if enable_vad:
+        vad_iterator = silero_vad.VADIterator(
+            vad_model or silero_vad.load_silero_vad(),
+            threshold=vad_config.threshold,
+            sampling_rate=audio_config.sample_rate,
+        )
+
+    stream = audio.open(
+        format=audio_config.format,
+        channels=audio_config.channels,
+        rate=audio_config.sample_rate,
+        input=True,
+        frames_per_buffer=audio_config.frames_per_buffer,
+    )
 
     try:
-        audio_buffer = deque(maxlen=PRE_SPEECH_FRAMES)  # Pre-speech buffer
+        audio_buffer = deque(maxlen=vad_config.pre_speech_frames)  # Pre-speech buffer
         current_speech_segment: typing.List[NDArray[np.float32]] = []
         post_speech_counter = 0
         speaking = False
 
-        if prompt is not None:
-            print(f"{prompt}: ", end="", flush=True)
-
         while True:
             audio_chunk_bytes: bytes = stream.read(
-                FRAME_SAMPLES, exception_on_overflow=False
+                audio_config.frames_per_buffer, exception_on_overflow=False
             )
             audio_int16: NDArray[np.int16] = np.frombuffer(audio_chunk_bytes, np.int16)
 
@@ -83,14 +89,17 @@ def input_audio(
             audio_float32 = np.clip(audio_float32, -1.0, 1.0)
 
             audio_tensor = torch.from_numpy(audio_float32)
-            speech_dict = vad_iterator(audio_tensor, return_seconds=False)
+            speech_dict = (
+                vad_iterator(audio_tensor, return_seconds=False)
+                if vad_iterator
+                else None
+            )
 
             # START
             if speech_dict and "start" in speech_dict:
                 if not speaking:
-                    if prompt is not None:
-                        print("🗣️", flush=True)
                     if verbose:
+                        print("🗣️", flush=True)
                         print(
                             "Speech start detected (sample index in stream: "
                             + f"{speech_dict['start']})"
@@ -122,7 +131,7 @@ def input_audio(
                     # Handle post-buffer
                     if post_speech_counter > 0:
                         post_speech_counter += 1
-                        if post_speech_counter > POST_SPEECH_FRAMES:
+                        if post_speech_counter > vad_config.post_speech_frames:
                             # Speech ended, process full audio
                             if current_speech_segment:
                                 full_speech_audio = np.concatenate(
@@ -146,7 +155,7 @@ def input_audio(
                                 # 3. Add fade-in and fade-out at the beginning
                                 # and end (to prevent pops)
                                 fade_samples = min(
-                                    int(0.01 * SAMPLE_RATE),
+                                    int(0.01 * audio_config.sample_rate),
                                     len(full_speech_audio) // 10,
                                 )
                                 if fade_samples > 0:
@@ -167,11 +176,11 @@ def input_audio(
                                         # Apply noise reduction using spectral gating
                                         full_speech_audio = nr.reduce_noise(
                                             y=full_speech_audio,
-                                            sr=SAMPLE_RATE,
-                                            stationary=NOISE_REDUCTION_STATIONARY,
-                                            prop_decrease=noise_reduction_strength,
-                                            n_std_thresh_stationary=1.5,  # Conservative
-                                            n_fft=1024,  # Optimized for speech
+                                            sr=audio_config.sample_rate,
+                                            stationary=noise_reduction_config.stationary,  # noqa: E501
+                                            prop_decrease=noise_reduction_config.prop_decrease,  # noqa: E501
+                                            n_std_thresh_stationary=noise_reduction_config.n_std_thresh_stationary,  # noqa: E501
+                                            n_fft=noise_reduction_config.n_fft,
                                         )
                                         if verbose:
                                             print(
@@ -184,7 +193,7 @@ def input_audio(
 
                                 print(
                                     "🎙️ Processed speech segment of "
-                                    + f"{len(full_speech_audio) / SAMPLE_RATE:.2f} "
+                                    + f"{len(full_speech_audio) / audio_config.sample_rate:.2f} "  # noqa: E501
                                     + "seconds"
                                 )
 
@@ -195,7 +204,7 @@ def input_audio(
                                     silero_vad.save_audio(
                                         path=str(output_audio_filepath),
                                         tensor=torch.from_numpy(full_speech_audio),
-                                        sampling_rate=SAMPLE_RATE,
+                                        sampling_rate=audio_config.sample_rate,
                                     )
                                     if verbose:
                                         print(f"📁 Saved to {output_audio_filepath}")
@@ -205,7 +214,7 @@ def input_audio(
                                 torchaudio.save(
                                     byte_io,
                                     torch.from_numpy(full_speech_audio).unsqueeze(0),
-                                    SAMPLE_RATE,
+                                    audio_config.sample_rate,
                                     bits_per_sample=16,
                                     format="wav",
                                 )
@@ -215,7 +224,8 @@ def input_audio(
                             speaking = False
                             current_speech_segment = []
                             post_speech_counter = 0
-                            vad_iterator.reset_states()
+                            if vad_iterator:
+                                vad_iterator.reset_states()
                 else:
                     # Maintain buffer even if no speech is detected
                     audio_buffer.append(audio_float32)
@@ -231,4 +241,58 @@ def input_audio(
         if "audio" in locals():
             audio.terminate()
         if "vad_iterator" in locals():
-            vad_iterator.reset_states()
+            if vad_iterator:
+                vad_iterator.reset_states()
+
+
+class AudioConfig(pydantic.BaseModel):
+    format: typing.Literal[8] = pydantic.Field(default=pyaudio.paInt16)  # type: ignore
+    channels: typing.Literal[1] = pydantic.Field(default=1)
+    sample_rate: typing.Literal[16000] = pydantic.Field(default=16000)
+    frames_per_buffer: typing.Literal[512] = pydantic.Field(default=512)
+    working_audio_buffer_ms: int = pydantic.Field(
+        default=5000,  # 5 seconds
+        description=(
+            "Max audio buffer in memory, "
+            + "all working process can only use this buffer, "
+            + "e.g. peak balance, noise reduction, VAD, etc."
+        ),
+    )
+
+    @property
+    def working_audio_buffer_frames(self) -> int:
+        return int(self.working_audio_buffer_ms * self.sample_rate / 1000)
+
+
+class VADConfig(pydantic.BaseModel):
+    threshold: float = pydantic.Field(default=0.5)
+    sampling_rate: typing.Literal[16000] = pydantic.Field(default=16000)
+    pre_speech_buffer_ms: int = pydantic.Field(default=300)
+    post_speech_buffer_ms: int = pydantic.Field(default=500)
+    frames_per_buffer: typing.Literal[512] = pydantic.Field(default=512)
+
+    @property
+    def pre_speech_frames(self) -> int:
+        return int(
+            self.pre_speech_buffer_ms
+            * self.sampling_rate
+            / 1000
+            / self.frames_per_buffer
+        )
+
+    @property
+    def post_speech_frames(self) -> int:
+        return int(
+            self.post_speech_buffer_ms
+            * self.sampling_rate
+            / 1000
+            / self.frames_per_buffer
+        )
+
+
+class NoiseReductionConfig(pydantic.BaseModel):
+    sample_rate: typing.Literal[16000] = pydantic.Field(default=16000)
+    stationary: bool = pydantic.Field(default=True)
+    prop_decrease: float = pydantic.Field(default=0.8)
+    n_std_thresh_stationary: float = pydantic.Field(default=1.5)
+    n_fft: int = pydantic.Field(default=1024)
