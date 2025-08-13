@@ -5,7 +5,9 @@ If enable VAD, it will save detected speech segments into speech segments queue 
 
 import io
 import pathlib
+import threading
 import typing
+import wave
 from collections import deque
 
 import noisereduce as nr
@@ -30,6 +32,8 @@ def input_audio(
     enable_noise_reduction: bool = False,
     noise_reduction_config: typing.Optional["NoiseReductionConfig"] = None,
     verbose: bool = False,
+    stop_event: typing.Optional[threading.Event] = None,
+    max_recording_duration_ms: int = 1 * 60 * 1000,  # 1 minute
 ) -> bytes:
     output_audio_filepath = (
         pathlib.Path(output_audio_filepath)
@@ -53,6 +57,15 @@ def input_audio(
 
     audio = pyaudio.PyAudio()
 
+    # Open Wave File
+    wave_file: typing.Optional[wave.Wave_write] = None
+    if output_audio_filepath:
+        output_audio_filepath.parent.mkdir(parents=True, exist_ok=True)
+        wave_file = wave.open(str(output_audio_filepath), "wb")
+        wave_file.setnchannels(audio_config.channels)
+        wave_file.setsampwidth(audio.get_sample_size(audio_config.format))
+        wave_file.setframerate(audio_config.sample_rate)
+
     vad_iterator: typing.Optional[silero_vad.VADIterator] = None
     if enable_vad:
         vad_iterator = silero_vad.VADIterator(
@@ -70,16 +83,27 @@ def input_audio(
     )
 
     try:
-        audio_buffer = deque(maxlen=vad_config.pre_speech_frames)  # Pre-speech buffer
+        current_recording_duration_ms = 0
+        speech_buffer = deque(maxlen=vad_config.pre_speech_frames)  # Pre-speech buffer
         current_speech_segment: typing.List[NDArray[np.float32]] = []
         post_speech_counter = 0
         speaking = False
 
         while True:
-            audio_chunk_bytes: bytes = stream.read(
+            raw_audio_chunk_bytes: bytes = stream.read(
                 audio_config.frames_per_buffer, exception_on_overflow=False
             )
-            audio_int16: NDArray[np.int16] = np.frombuffer(audio_chunk_bytes, np.int16)
+            # Accumulate current recording duration based on bytes read
+            frames_in_chunk = len(raw_audio_chunk_bytes) // (
+                audio.get_sample_size(audio_config.format) * audio_config.channels
+            )
+            chunk_ms = int(frames_in_chunk * 1000 / audio_config.sample_rate)
+            current_recording_duration_ms += chunk_ms
+
+            # To numpy array
+            audio_int16: NDArray[np.int16] = np.frombuffer(
+                raw_audio_chunk_bytes, np.int16
+            )
 
             # More precise normalization to avoid clipping
             audio_float32: NDArray[np.float32] = (
@@ -88,12 +112,31 @@ def input_audio(
             # Ensure the range is between [-1, 1]
             audio_float32 = np.clip(audio_float32, -1.0, 1.0)
 
+            if wave_file:
+                wave_file.writeframes(raw_audio_chunk_bytes)
+
+            # Stop conditions
+            if stop_event and stop_event.is_set():
+                if verbose:
+                    print("Stop event set, stopping recording", flush=True)
+                break
+            if current_recording_duration_ms >= max_recording_duration_ms:
+                if verbose:
+                    print(
+                        "Max recording duration reached: "
+                        + f"{current_recording_duration_ms} ms >= "
+                        + f"{max_recording_duration_ms} ms",
+                        flush=True,
+                    )
+                break
+
+            # To tensor
             audio_tensor = torch.from_numpy(audio_float32)
-            speech_dict = (
-                vad_iterator(audio_tensor, return_seconds=False)
-                if vad_iterator
-                else None
-            )
+
+            speech_dict: typing.Optional[SpeechParam] = None
+            if vad_iterator:
+                _vad_result = vad_iterator(audio_tensor, return_seconds=False)
+                speech_dict = SpeechParam(**_vad_result) if _vad_result else None
 
             # START
             if speech_dict and "start" in speech_dict:
@@ -107,7 +150,7 @@ def input_audio(
                     speaking = True
 
                     # Add pre-buffered audio to speech segment
-                    current_speech_segment = list(audio_buffer)
+                    current_speech_segment = list(speech_buffer)
                     post_speech_counter = 0
 
                 current_speech_segment.append(audio_float32)
@@ -228,7 +271,7 @@ def input_audio(
                                 vad_iterator.reset_states()
                 else:
                     # Maintain buffer even if no speech is detected
-                    audio_buffer.append(audio_float32)
+                    speech_buffer.append(audio_float32)
 
     except KeyboardInterrupt as e:
         raise e
@@ -243,6 +286,11 @@ def input_audio(
         if "vad_iterator" in locals():
             if vad_iterator:
                 vad_iterator.reset_states()
+        if "wave_file" in locals() and wave_file:
+            wave_file.close()
+
+    # Return empty bytes if no speech segment was produced before stopping
+    return b""
 
 
 class AudioConfig(pydantic.BaseModel):
@@ -296,3 +344,8 @@ class NoiseReductionConfig(pydantic.BaseModel):
     prop_decrease: float = pydantic.Field(default=0.8)
     n_std_thresh_stationary: float = pydantic.Field(default=1.5)
     n_fft: int = pydantic.Field(default=1024)
+
+
+class SpeechParam(typing.TypedDict):
+    start: int | float
+    end: int | float
