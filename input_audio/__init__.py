@@ -26,14 +26,16 @@ def input_audio(
     output_audio_filepath: pathlib.Path | str,
     *,
     audio_config: typing.Optional["AudioConfig"] = None,
+    # VAD
     enable_vad: bool = False,
     vad_config: typing.Optional["VADConfig"] = None,
     vad_model: typing.Optional[torch.nn.Module] = None,
+    # Noise Reduction
     enable_noise_reduction: bool = False,
     noise_reduction_config: typing.Optional["NoiseReductionConfig"] = None,
-    verbose: bool = False,
     stop_event: typing.Optional[threading.Event] = None,
     max_recording_duration_ms: int = 1 * 60 * 1000,  # 1 minute
+    verbose: bool = False,
 ) -> bytes:
     output_audio_filepath = pathlib.Path(output_audio_filepath)
     audio_config = audio_config or AudioConfig()
@@ -82,6 +84,8 @@ def input_audio(
         input=True,
         frames_per_buffer=audio_config.frames_per_buffer,
     )
+    if verbose:
+        print("🎤 Starting recording...", flush=True)
 
     cur_dur = 0
     speech_buffer = deque(maxlen=vad_config.pre_speech_frames)  # Pre-speech buffer
@@ -161,6 +165,12 @@ def input_audio(
                 _frames_to_write = min(_unread_frames, _processed_working_buffer.size)
                 if _frames_to_write > 0:
                     _processed_chunk = _processed_working_buffer[-_frames_to_write:]
+                    # Optional output gain (streaming path)
+                    if audio_config.gain_db != 0.0:
+                        _gain = np.power(
+                            10.0, audio_config.gain_db / 20.0, dtype=np.float32
+                        )
+                        _processed_chunk = np.clip(_processed_chunk * _gain, -1.0, 1.0)
                     # Convert float32 [-1,1] to int16 bytes for WAV write
                     _chunk_int16 = np.clip(
                         _processed_chunk * 32767.0, -32768, 32767
@@ -273,6 +283,26 @@ def input_audio(
                                             print(f"⚠️  Noise reduction failed: {e}")
                                         # Continue without noise reduction if it fails
 
+                                # Re-normalize after NR to recover any loudness loss
+                                max_val_post = np.max(np.abs(full_speech_audio))
+                                if max_val_post > 0:
+                                    full_speech_audio = full_speech_audio * (
+                                        0.95 / max_val_post
+                                    )
+
+                                # Optional output gain (VAD path)
+                                if audio_config.gain_db != 0.0:
+                                    gain = np.power(
+                                        10.0,
+                                        audio_config.gain_db / 20.0,
+                                        dtype=np.float32,
+                                    )
+                                    full_speech_audio = np.clip(
+                                        full_speech_audio * gain,
+                                        -1.0,
+                                        1.0,
+                                    )
+
                                 print(
                                     "🎙️ Processed speech segment of "
                                     + f"{len(full_speech_audio) / audio_config.sample_rate:.2f} "  # noqa: E501
@@ -359,6 +389,14 @@ def input_audio(
                     )
                     if _frames_to_write > 0:
                         _processed_chunk = _processed_working_buffer[-_frames_to_write:]
+                        # Optional output gain (final flush)
+                        if audio_config.gain_db != 0.0:
+                            _gain = np.power(
+                                10.0, audio_config.gain_db / 20.0, dtype=np.float32
+                            )
+                            _processed_chunk = np.clip(
+                                _processed_chunk * _gain, -1.0, 1.0
+                            )
                         _chunk_int16 = np.clip(
                             _processed_chunk * 32767.0, -32768, 32767
                         ).astype(np.int16)
@@ -386,6 +424,7 @@ class AudioConfig(pydantic.BaseModel):
         ),
     )
     batch_process_ms: int = pydantic.Field(default=500)
+    gain_db: float = pydantic.Field(default=20.0)
 
     @property
     def rolling_working_audio_buffer_frames(self) -> int:
