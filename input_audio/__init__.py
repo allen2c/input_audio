@@ -2,6 +2,7 @@
 Record microphone audio to a WAV file in real time.
 Optionally run VAD to emit speech segments and noise reduction for cleaner audio.
 High level API interface, all want to know is sample rate, channels, format, buffer size, and parameters in mini seconds.
+In this api, the (buffer size / sample rate) must integer in mini seconds.
 Let properties and methods to handle the low level details.
 Simple API; streaming write with periodic processing.
 Processing audio in float32.
@@ -599,3 +600,10 @@ def finalize_and_emit_vad_segment(
     )
 
     return None
+
+
+def is_latency_ms_integer(
+    sample_rate: int,
+    buffer_size: int,
+) -> bool:
+    return buffer_size % (sample_rate / 1000) == 0
