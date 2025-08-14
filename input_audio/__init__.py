@@ -1,8 +1,17 @@
 """
 Record microphone audio to a WAV file in real time.
 Optionally run VAD to emit speech segments and noise reduction for cleaner audio.
+High level API interface, all want to know is sample rate, channels, format, buffer size, and parameters in mini seconds.
+Let properties and methods to handle the low level details.
 Simple API; streaming write with periodic processing.
-"""
+Processing audio in float32.
+
+Currently supports:
+- Sample rate: 16000 Hz
+- Channels: 1
+- Format: 16-bit PCM
+- buffer size: 512
+"""  # noqa: E501
 
 import io
 import pathlib
@@ -51,13 +60,13 @@ def input_audio(
         vad_dirpath.mkdir(parents=True, exist_ok=True)
 
     if (
-        audio_config.sample_rate != vad_config.sampling_rate
+        audio_config.sample_rate != vad_config.sample_rate
         or audio_config.sample_rate != noise_reduction_config.sample_rate
     ):
         raise ValueError(
             "Audio config sample rate must be the same as VAD config sample rate "
             + "and noise reduction config sample rate, "
-            + f"but got {audio_config.sample_rate}, {vad_config.sampling_rate}, "
+            + f"but got {audio_config.sample_rate}, {vad_config.sample_rate}, "
             + f"{noise_reduction_config.sample_rate}"
         )
 
@@ -86,7 +95,7 @@ def input_audio(
         channels=audio_config.channels,
         rate=audio_config.sample_rate,
         input=True,
-        frames_per_buffer=audio_config.frames_per_buffer,
+        frames_per_buffer=audio_config.buffer_size,
     )
     if verbose:
         print("🎤 Starting recording...", flush=True)
@@ -109,7 +118,7 @@ def input_audio(
     try:
         while True:
             raw_audio_chunk_bytes: bytes = stream.read(
-                audio_config.frames_per_buffer, exception_on_overflow=False
+                audio_config.buffer_size, exception_on_overflow=False
             )
             # Accumulate current recording duration based on bytes read
             frames_in_chunk = len(raw_audio_chunk_bytes) // (
@@ -177,18 +186,19 @@ def input_audio(
                         )
                     speaking = True
                     # Add pre-buffered audio to speech segment from rolling buffer
-                    pre_speech_samples = int(
-                        vad_config.pre_speech_buffer_ms
+                    required_before_speech_samples = int(
+                        vad_config.keep_before_speech_ms
                         * audio_config.sample_rate
                         / 1000
                     )
                     if (
-                        pre_speech_samples > 0
+                        required_before_speech_samples > 0
                         and rolling_working_buffer_float32.size > 0
                     ):
                         pre_start_idx = max(
                             0,
-                            rolling_working_buffer_float32.size - pre_speech_samples,
+                            rolling_working_buffer_float32.size
+                            - required_before_speech_samples,
                         )
                         pre_audio = rolling_working_buffer_float32[pre_start_idx:]
                         current_speech_segment = [pre_audio]
@@ -197,7 +207,7 @@ def input_audio(
                     # Estimate start time in ms
                     speech_start_ms = max(
                         0,
-                        (cur_dur - chunk_ms) - vad_config.pre_speech_buffer_ms,
+                        (cur_dur - chunk_ms) - vad_config.keep_before_speech_ms,
                     )
                     post_speech_counter = 0
 
@@ -222,7 +232,7 @@ def input_audio(
                     # Handle post-buffer
                     if post_speech_counter > 0:
                         post_speech_counter += 1
-                        if post_speech_counter > vad_config.post_speech_frames:
+                        if post_speech_counter > vad_config.after_speech_frames:
                             # Speech ended, process full audio
                             if current_speech_segment:
                                 finalize_and_emit_vad_segment(
@@ -315,7 +325,7 @@ class AudioConfig(pydantic.BaseModel):
     format: typing.Literal[8] = pydantic.Field(default=pyaudio.paInt16)  # type: ignore
     channels: typing.Literal[1] = pydantic.Field(default=1)
     sample_rate: typing.Literal[16000] = pydantic.Field(default=16000)
-    frames_per_buffer: typing.Literal[512] = pydantic.Field(default=512)
+    buffer_size: typing.Literal[512] = pydantic.Field(default=512)
     rolling_working_audio_buffer_ms: int = pydantic.Field(
         default=5000,  # 5 seconds
         description=(
@@ -334,27 +344,21 @@ class AudioConfig(pydantic.BaseModel):
 
 class VADConfig(pydantic.BaseModel):
     threshold: float = pydantic.Field(default=0.5)
-    sampling_rate: typing.Literal[16000] = pydantic.Field(default=16000)
-    pre_speech_buffer_ms: int = pydantic.Field(default=300)
-    post_speech_buffer_ms: int = pydantic.Field(default=500)
-    frames_per_buffer: typing.Literal[512] = pydantic.Field(default=512)
+    sample_rate: typing.Literal[16000] = pydantic.Field(default=16000)
+    keep_before_speech_ms: int = pydantic.Field(default=300)
+    keep_after_speech_ms: int = pydantic.Field(default=500)
+    buffer_size: typing.Literal[512] = pydantic.Field(default=512)
 
     @property
-    def pre_speech_frames(self) -> int:
+    def before_speech_frames(self) -> int:
         return int(
-            self.pre_speech_buffer_ms
-            * self.sampling_rate
-            / 1000
-            / self.frames_per_buffer
+            self.keep_before_speech_ms * self.sample_rate / 1000 / self.buffer_size
         )
 
     @property
-    def post_speech_frames(self) -> int:
+    def after_speech_frames(self) -> int:
         return int(
-            self.post_speech_buffer_ms
-            * self.sampling_rate
-            / 1000
-            / self.frames_per_buffer
+            self.keep_after_speech_ms * self.sample_rate / 1000 / self.buffer_size
         )
 
 
