@@ -79,7 +79,7 @@ while not segments_q.empty():
     print(seg.start_ms, seg.end_ms, len(seg.audio_url.data))
 ```
 
-Customize audio settings (16kHz mono, 512 buffer, batch processing every 500ms):
+Customize audio settings (16kHz mono, 512 buffer, batch processing every 320ms):
 
 ```python
 from input_audio import input_audio, AudioConfig
@@ -88,7 +88,7 @@ cfg = AudioConfig(
     sample_rate=16000,
     channels=1,
     buffer_size=512,
-    batch_process_ms=500,
+    batch_process_ms=320,
     gain_db=20.0,
 )
 
@@ -134,7 +134,7 @@ AudioConfig(
     sample_rate=16000,
     buffer_size=512,
     rolling_working_audio_buffer_ms=5000,
-    batch_process_ms=500,
+    batch_process_ms=320,
     gain_db=20.0,
 )
 
