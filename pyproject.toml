@@ -3,6 +3,7 @@ authors = [{ name = "Allen Chou", email = "f1470891079@gmail.com" }]
 dependencies = [
   "dictpress (>=0.3.0)",
   "durl-py (>=0.1.1)",
+  "logging-bullet-train",
   "noisereduce (>=3,<4)",
   "numpy (>=2,<3)",
   "openai (>=1,<2)",
