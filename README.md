@@ -1,14 +1,16 @@
 # input_audio
 
-Real-time audio input with voice activity detection and noise reduction for Python.
+Real-time mic recording to WAV with optional VAD segmentation and noise reduction.
+
+Millisecond-based API; `buffer_size / sample_rate` must be an integer number of milliseconds. Audio is processed in float32, and written to 16‑bit PCM WAV.
 
 ## Features
 
-- **Voice Activity Detection**: Automatically detects when speech starts and stops
-- **Noise Reduction**: Built-in noise reduction for cleaner audio
-- **Real-time Processing**: Low-latency audio capture and processing
-- **Flexible Output**: Save to file or return as bytes
-- **Easy Integration**: Simple API for quick implementation
+- **Voice Activity Detection (VAD)**: Detect speech start/end and emit segments
+- **Noise Reduction (NR)**: Built-in denoiser for cleaner audio
+- **Streaming to File**: Continuous WAV writing with periodic processing
+- **Millisecond-first API**: Simple timing controls using milliseconds
+- **Observability**: Uses `logging` for friendly debug output when enabled
 
 ## Installation
 
@@ -24,82 +26,162 @@ cd input_audio
 pip install -e .
 ```
 
-## Usage
+## Quick Start
 
-### Basic Usage
-
-```python
-from input_audio import input_audio
-
-# Capture audio with a prompt
-audio_bytes = input_audio("Please speak:")
-```
-
-### Save to File
+Record to a WAV file for 5 seconds:
 
 ```python
 from input_audio import input_audio
 
-# Capture and save audio
-audio_bytes = input_audio(
-    "Record your message:",
-    output_audio_filepath="recording.wav"
+input_audio(
+    "./recordings/quick.wav",
+    max_recording_duration_ms=5000,
 )
 ```
 
-### Advanced Configuration
+Enable noise reduction and verbose logging:
 
 ```python
-from input_audio import input_audio
+import logging
+from input_audio import input_audio, NoiseReductionConfig
 
-# Customize noise reduction and enable verbose output
-audio_bytes = input_audio(
-    "Speak now:",
+logging.basicConfig(level=logging.INFO)
+
+input_audio(
+    "./recordings/nr.wav",
     enable_noise_reduction=True,
-    noise_reduction_strength=0.8,  # 0.0-1.0
-    verbose=True
+    noise_reduction_config=NoiseReductionConfig(prop_decrease=0.8),
+    max_recording_duration_ms=5000,
+    verbose=True,
 )
 ```
 
-### Silent Capture
+Enable VAD, collect segments into a queue, and also save segments to a folder:
 
 ```python
-from input_audio import input_audio
+import queue
+from input_audio import input_audio, VADConfig
 
-# Capture without prompt
-audio_bytes = input_audio()
+segments_q: queue.Queue = queue.Queue()
+
+input_audio(
+    "./recordings/full.wav",
+    enable_vad=True,
+    vad_config=VADConfig(pre_speech_padding_ms=300, post_speech_padding_ms=500),
+    vad_segments_queue=segments_q,
+    vad_dirpath="./tmp_vad",  # optional: segment WAVs written here
+    max_recording_duration_ms=10000,
+)
+
+# Read emitted segments from the queue (each item has start_ms, end_ms, audio_url)
+while not segments_q.empty():
+    seg = segments_q.get()
+    print(seg.start_ms, seg.end_ms, len(seg.audio_url.data))
 ```
 
-## API Reference
+Customize audio settings (16kHz mono, 512 buffer, batch processing every 320ms):
 
-### `input_audio(prompt=None, *, output_audio_filepath=None, verbose=False, enable_noise_reduction=True, noise_reduction_strength=0.8)`
+```python
+from input_audio import input_audio, AudioConfig
 
-**Parameters:**
+cfg = AudioConfig(
+    sample_rate=16000,
+    channels=1,
+    buffer_size=512,
+    batch_process_ms=320,
+    gain_db=20.0,
+)
 
-- `prompt` (str, optional): Text prompt to display before recording
-- `output_audio_filepath` (str/Path, optional): Path to save the audio file
-- `verbose` (bool): Enable detailed logging (default: False)
-- `enable_noise_reduction` (bool): Apply noise reduction (default: True)
-- `noise_reduction_strength` (float): Noise reduction intensity, 0.0-1.0 (default: 0.8)
+input_audio(
+    "./recordings/custom.wav",
+    audio_config=cfg,
+    max_recording_duration_ms=5000,
+)
+```
 
-**Returns:**
+Notes:
 
-- `bytes`: WAV audio data
+- `input_audio(...)` returns `b""`; the primary outputs are the continuously written WAV file and (optionally) VAD segments.
+- Timing constraints are enforced and will raise `ValueError` if violated.
+- NR order: noise reduction is applied before gain for consistent loudness.
 
-**Behavior:**
+## API Reference (v0.2.0)
 
-- Automatically starts recording when speech is detected
-- Stops recording after speech ends (with configurable buffer)
-- Applies noise reduction and audio enhancement
-- Returns high-quality 16kHz mono WAV audio
+```python
+input_audio(
+    output_audio_filepath: str | Path,
+    *,
+    audio_config: Optional[AudioConfig] = None,
+    enable_vad: bool = False,
+    vad_config: Optional[VADConfig] = None,
+    vad_model: Optional[torch.nn.Module] = None,
+    vad_segments_queue: Optional[queue.Queue[VADSegment]] = None,
+    vad_dirpath: Optional[str | Path] = None,
+    enable_noise_reduction: bool = False,
+    noise_reduction_config: Optional[NoiseReductionConfig] = None,
+    stop_event: Optional[threading.Event] = None,
+    max_recording_duration_ms: int = 60000,
+    verbose: bool = False,
+) -> bytes
+```
+
+Key models:
+
+```python
+AudioConfig(
+    format=pyaudio.paInt16,  # 16‑bit PCM
+    channels=1,
+    sample_rate=16000,
+    buffer_size=512,
+    rolling_working_audio_buffer_ms=5000,
+    batch_process_ms=320,
+    gain_db=20.0,
+)
+
+VADConfig(
+    threshold=0.5,
+    pre_speech_padding_ms=300,
+    post_speech_padding_ms=500,
+)
+
+NoiseReductionConfig(
+    sample_rate=16000,
+    stationary=True,
+    prop_decrease=0.8,
+    n_std_thresh_stationary=1.5,
+    n_fft=1024,
+)
+```
+
+Constraints:
+
+- `buffer_size * 1000 % sample_rate == 0` (buffer duration must be whole ms)
+- `batch_process_ms` must be a multiple of the buffer duration (ms)
+- `AudioConfig.sample_rate` must match `NoiseReductionConfig.sample_rate`
+
+## Changelog — v0.2.0
+
+Breaking changes:
+
+- Renamed `VADConfig.keep_before_speech_ms` → `pre_speech_padding_ms`
+- Renamed `VADConfig.keep_after_speech_ms` → `post_speech_padding_ms`
+- Removed `VADConfig.sample_rate` and `VADConfig.buffer_size` (VAD shares audio settings)
+
+Behavioral and quality updates:
+
+- Apply noise reduction before gain (consistent final loudness)
+- Replace prints with `logging.getLogger(__name__)`
+- Enforce timing constraints with clear error messages
+- Integer-safe latency checks; fade-in/out uses float32 consistently
 
 ## Requirements
 
 - Python 3.11+
 - PyAudio (microphone access)
-- PyTorch (VAD model)
-- Additional dependencies: see `requirements.txt`
+- PyTorch and torchaudio (VAD model, WAV encoding)
+- Numpy, noisereduce, silero_vad
+- See `requirements.txt` for full list
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+MIT License — see [LICENSE](LICENSE) for details.
