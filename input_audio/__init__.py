@@ -1,20 +1,28 @@
 """
 Record microphone audio to a WAV file in real time.
-Optionally run VAD to emit speech segments and noise reduction for cleaner audio.
-High level API interface, all want to know is sample rate, channels, format, buffer size, and parameters in mini seconds.
-In this api, the (buffer size / sample rate) must integer in mini seconds.
-Let properties and methods to handle the low level details.
-Simple API; streaming write with periodic processing.
-Processing audio in float32.
+
+Optionally run voice activity detection (VAD) to emit speech segments, and apply
+noise reduction for cleaner audio.
+
+Simple, high‑level API: you only provide sample rate, channels, format, buffer
+size, and timing parameters in milliseconds. Properties and methods handle the
+low‑level details for you.
+
+This API streams to disk with periodic processing. Audio is processed in
+float32, while the on‑disk WAV uses 16‑bit PCM.
+
+Timing constraint: buffer_size / sample_rate must yield an integer number of
+milliseconds.
 
 Currently supports:
 - Sample rate: 16000 Hz
 - Channels: 1
-- Format: 16-bit PCM
-- buffer size: 512
-"""  # noqa: E501
+- Format: 16‑bit PCM
+- Buffer size: 512
+"""
 
 import io
+import logging
 import pathlib
 import queue
 import threading
@@ -34,6 +42,9 @@ from numpy.typing import NDArray
 __version__ = pathlib.Path(__file__).parent.joinpath("VERSION").read_text().strip()
 
 
+logger = logging.getLogger(__name__)
+
+
 def input_audio(
     output_audio_filepath: pathlib.Path | str,
     *,
@@ -51,6 +62,10 @@ def input_audio(
     max_recording_duration_ms: int = 1 * 60 * 1000,  # 1 minute
     verbose: bool = False,
 ) -> bytes:
+    """Record mic audio to WAV; optional VAD segments and noise reduction.
+    Enforces millisecond-based timing; streams to file with periodic processing.
+    Returns empty bytes upon completion (outputs are file/queue side-effects).
+    """
     output_audio_filepath = pathlib.Path(output_audio_filepath)
     audio_config = audio_config or AudioConfig()
     vad_config = vad_config or VADConfig()
@@ -60,22 +75,64 @@ def input_audio(
         vad_dirpath = pathlib.Path(vad_dirpath)
         vad_dirpath.mkdir(parents=True, exist_ok=True)
 
-    if (
-        audio_config.sample_rate != vad_config.sample_rate
-        or audio_config.sample_rate != noise_reduction_config.sample_rate
-    ):
+    # Sample rate consistency (audio and NR must match)
+    if audio_config.sample_rate != noise_reduction_config.sample_rate:
         raise ValueError(
-            "Audio config sample rate must be the same as VAD config sample rate "
-            + "and noise reduction config sample rate, "
-            + f"but got {audio_config.sample_rate}, {vad_config.sample_rate}, "
+            "Invalid configuration: audio sample rates must match. "
+            + f"audio.sample_rate={audio_config.sample_rate}, "
+            + "noise_reduction.sample_rate="
             + f"{noise_reduction_config.sample_rate}"
         )
 
     if audio_config.batch_process_ms >= audio_config.rolling_working_audio_buffer_ms:
         raise ValueError(
-            "Audio config batch process ms must be less than or equal to "
-            + "audio config rolling working audio buffer ms, "
-            + f"but got {audio_config.batch_process_ms}, {audio_config.rolling_working_audio_buffer_ms}"  # noqa: E501
+            "Invalid configuration: batch_process_ms must be less than "
+            + "rolling_working_audio_buffer_ms. "
+            + f"batch_process_ms={audio_config.batch_process_ms}, "
+            + "rolling_working_audio_buffer_ms="
+            + f"{audio_config.rolling_working_audio_buffer_ms}"
+        )
+
+    # Buffer latency must be an integer number of milliseconds
+    if not is_latency_ms_integer(
+        sample_rate=audio_config.sample_rate,
+        buffer_size=audio_config.buffer_size,
+    ):
+        raise ValueError(
+            "Invalid configuration: buffer_size must yield integer milliseconds at "
+            + "the given sample_rate. "
+            + f"buffer_size={audio_config.buffer_size}, "
+            + f"sample_rate={audio_config.sample_rate}"
+        )
+
+    # batch_process_ms must be multiple of buffer duration (ms)
+    if not is_batch_multiple_of_buffer_ms(
+        batch_ms=audio_config.batch_process_ms,
+        sample_rate=audio_config.sample_rate,
+        buffer_size=audio_config.buffer_size,
+    ):
+        raise ValueError(
+            "Invalid configuration: batch_process_ms must be a multiple of the "
+            + "buffer duration (in ms). "
+            + f"batch_process_ms={audio_config.batch_process_ms}, "
+            + f"buffer_size={audio_config.buffer_size}, "
+            + f"sample_rate={audio_config.sample_rate}"
+        )
+
+    # Compute and validate VAD post-speech frames threshold based on shared audio params
+    vad_after_frames = ms_to_buffer_frames(
+        ms=(vad_config.post_speech_padding_ms),
+        sample_rate=audio_config.sample_rate,
+        buffer_size=audio_config.buffer_size,
+    )
+    if vad_after_frames < 1:
+        raise ValueError(
+            "Invalid configuration: post_speech_padding_ms too small for current "
+            + "buffer_size; results in 0 frames. Increase post_speech_padding_ms "
+            + "or reduce buffer_size. "
+            + f"post_speech_padding_ms={vad_config.post_speech_padding_ms}, "
+            + f"buffer_size={audio_config.buffer_size}, "
+            + f"sample_rate={audio_config.sample_rate}"
         )
 
     audio = pyaudio.PyAudio()
@@ -99,7 +156,7 @@ def input_audio(
         frames_per_buffer=audio_config.buffer_size,
     )
     if verbose:
-        print("🎤 Starting recording...", flush=True)
+        logger.info("🎤 Starting recording...")
 
     cur_dur = 0
     current_speech_segment: typing.List[NDArray[np.float32]] = []
@@ -180,15 +237,14 @@ def input_audio(
             if speech_dict and "start" in speech_dict:
                 if not speaking:
                     if verbose:
-                        print("🗣️", flush=True)
-                        print(
-                            "Speech start detected (sample index in stream: "
-                            + f"{speech_dict['start']})"
+                        logger.info(
+                            "🗣️ Speech start detected (sample index: %s)",
+                            speech_dict["start"],  # type: ignore[index]
                         )
                     speaking = True
                     # Add pre-buffered audio to speech segment from rolling buffer
                     required_before_speech_samples = int(
-                        vad_config.keep_before_speech_ms
+                        vad_config.pre_speech_padding_ms
                         * audio_config.sample_rate
                         / 1000
                     )
@@ -208,7 +264,7 @@ def input_audio(
                     # Estimate start time in ms
                     speech_start_ms = max(
                         0,
-                        (cur_dur - chunk_ms) - vad_config.keep_before_speech_ms,
+                        (cur_dur - chunk_ms) - vad_config.pre_speech_padding_ms,
                     )
                     post_speech_counter = 0
 
@@ -218,9 +274,9 @@ def input_audio(
             elif speech_dict and "end" in speech_dict:
                 if speaking:
                     if verbose:
-                        print(
-                            "Speech end detected (sample index in stream: "
-                            + f"{speech_dict['end']})"
+                        logger.info(
+                            "Speech end detected (sample index: %s)",
+                            speech_dict["end"],  # type: ignore[index]
                         )
                     current_speech_segment.append(audio_chunk_float32)
                     post_speech_counter = 1  # Start post-speech buffer count
@@ -233,7 +289,7 @@ def input_audio(
                     # Handle post-buffer
                     if post_speech_counter > 0:
                         post_speech_counter += 1
-                        if post_speech_counter > vad_config.after_speech_frames:
+                        if post_speech_counter > vad_after_frames:
                             # Speech ended, process full audio
                             if current_speech_segment:
                                 finalize_and_emit_vad_segment(
@@ -261,7 +317,7 @@ def input_audio(
             # Stop conditions
             if stop_event and stop_event.is_set():
                 if verbose:
-                    print("Stop event set, stopping recording", flush=True)
+                    logger.info("Stop event set, stopping recording")
                 break
 
     except KeyboardInterrupt as e:
@@ -335,7 +391,7 @@ class AudioConfig(pydantic.BaseModel):
             + "e.g. peak balance, noise reduction, VAD, etc."
         ),
     )
-    batch_process_ms: int = pydantic.Field(default=500)
+    batch_process_ms: int = pydantic.Field(default=320)
     gain_db: float = pydantic.Field(default=20.0)
 
     @property
@@ -345,22 +401,8 @@ class AudioConfig(pydantic.BaseModel):
 
 class VADConfig(pydantic.BaseModel):
     threshold: float = pydantic.Field(default=0.5)
-    sample_rate: typing.Literal[16000] = pydantic.Field(default=16000)
-    keep_before_speech_ms: int = pydantic.Field(default=300)
-    keep_after_speech_ms: int = pydantic.Field(default=500)
-    buffer_size: typing.Literal[512] = pydantic.Field(default=512)
-
-    @property
-    def before_speech_frames(self) -> int:
-        return int(
-            self.keep_before_speech_ms * self.sample_rate / 1000 / self.buffer_size
-        )
-
-    @property
-    def after_speech_frames(self) -> int:
-        return int(
-            self.keep_after_speech_ms * self.sample_rate / 1000 / self.buffer_size
-        )
+    pre_speech_padding_ms: int = pydantic.Field(default=300)
+    post_speech_padding_ms: int = pydantic.Field(default=500)
 
 
 class NoiseReductionConfig(pydantic.BaseModel):
@@ -389,20 +431,14 @@ def to_normalized_npfloat32(array: NDArray[np.int16]) -> NDArray[np.float32]:
     return audio_chunk_float32
 
 
-def is_max_dur_reached(
-    cur_dur: int,
-    max_dur: int,
-    *,
-    verbose: bool,
-) -> bool:
+def is_max_dur_reached(cur_dur: int, max_dur: int, *, verbose: bool) -> bool:
     if cur_dur >= max_dur:
         if verbose:
             temp_max_dur_reached_msg = (
                 "Max recording duration reached: {cur_dur} ms >= {max_dur} ms"
             )
-            print(
-                temp_max_dur_reached_msg.format(cur_dur=cur_dur, max_dur=max_dur),
-                flush=True,
+            logger.info(
+                temp_max_dur_reached_msg.format(cur_dur=cur_dur, max_dur=max_dur)
             )
         return True
     return False
@@ -413,7 +449,7 @@ def open_wave_file(
     audio_config: "AudioConfig",
     audio: pyaudio.PyAudio,
 ) -> wave.Wave_write:
-    """Open a WAV file writer configured by audio_config."""
+    """Open a WAV writer configured by the provided audio settings."""
     output_audio_filepath.parent.mkdir(parents=True, exist_ok=True)
     wf = wave.open(str(output_audio_filepath), "wb")
     wf.setnchannels(audio_config.channels)
@@ -428,7 +464,7 @@ def append_and_trim_rolling_buffer(
     *,
     max_frames: int,
 ) -> NDArray[np.float32]:
-    """Append chunk and trim to max_frames from the end."""
+    """Append chunk then trim to the last max_frames samples."""
     if rolling_buffer.size == 0:
         merged = new_chunk
     else:
@@ -446,7 +482,7 @@ def maybe_reduce_noise(
     sample_rate: int,
     verbose: bool = False,
 ) -> NDArray[np.float32]:
-    """Apply noise reduction if enabled; fall back on any error."""
+    """Apply noise reduction first; return input on any error or if disabled."""
     if not enable:
         return samples
     try:
@@ -463,14 +499,14 @@ def maybe_reduce_noise(
         )
     except Exception as e:  # noqa: BLE001
         if verbose:
-            print(f"⚠️  Noise reduction failed: {e}")
+            logger.warning("Noise reduction failed: %s", e)
         return samples
 
 
 def apply_output_gain(
     samples: NDArray[np.float32], *, gain_db: float
 ) -> NDArray[np.float32]:
-    """Apply linear gain in-place-safe manner (returns new array)."""
+    """Apply linear gain with float32 headroom and clipping protection."""
     if gain_db == 0.0:
         return samples
     gain = np.power(10.0, gain_db / 20.0, dtype=np.float32)
@@ -478,7 +514,7 @@ def apply_output_gain(
 
 
 def float32_to_int16_bytes(samples: NDArray[np.float32]) -> bytes:
-    """Convert normalized float32 [-1,1] to int16 bytes."""
+    """Convert normalized float32 [-1, 1] PCM to int16 WAV bytes."""
     int16 = np.clip(samples * 32767.0, -32768, 32767).astype(np.int16)
     return int16.tobytes()
 
@@ -491,7 +527,7 @@ def write_tail_wav_since_last_write(
     wave_file: wave.Wave_write,
     gain_db: float,
 ) -> int:
-    """Write only the unread tail frames and return updated total_frames_written."""
+    """Write unread tail frames and return the updated total_frames_written."""
     unread_frames = total_frames_read - total_frames_written
     frames_to_write = min(unread_frames, processed_working_buffer.size)
     if frames_to_write <= 0:
@@ -506,24 +542,24 @@ def write_tail_wav_since_last_write(
 def apply_fade_in_out(
     samples: NDArray[np.float32], *, sample_rate: int
 ) -> NDArray[np.float32]:
-    """Apply short fade-in and fade-out to avoid pops."""
+    """Apply short fade-in/out to reduce clicks at boundaries."""
     if samples.size == 0:
         return samples
     fade_samples = min(int(0.01 * sample_rate), max(1, samples.size // 10))
     if fade_samples <= 0:
         return samples
     out = samples.copy()
-    fade_in = np.linspace(0, 1, fade_samples)
+    fade_in = np.linspace(0, 1, fade_samples, dtype=np.float32)
     out[:fade_samples] *= fade_in
-    fade_out = np.linspace(1, 0, fade_samples)
+    fade_out = np.linspace(1, 0, fade_samples, dtype=np.float32)
     out[-fade_samples:] *= fade_out
-    return out
+    return out.astype(np.float32, copy=False)
 
 
 def vad_segment_to_bytes_and_url(
     segment: NDArray[np.float32], *, sample_rate: int
 ) -> tuple[bytes, durl.DataURL]:
-    """Encode float32 mono PCM to WAV bytes and return data URL."""
+    """Encode float32 mono PCM to WAV bytes and build a data URL."""
     byte_io = io.BytesIO()
     torchaudio.save(
         byte_io,
@@ -547,7 +583,7 @@ def emit_vad_segment_outputs(
     vad_segments_queue: typing.Optional[queue.Queue["VADSegment"]],
     vad_dirpath: typing.Optional[pathlib.Path],
 ) -> None:
-    """Emit outputs for a finalized speech segment (queue and/or file)."""
+    """Emit finalized speech segment to queue and/or file path."""
     wav_bytes, audio_url = vad_segment_to_bytes_and_url(
         segment, sample_rate=sample_rate
     )
@@ -577,12 +613,11 @@ def finalize_and_emit_vad_segment(
     vad_dirpath: typing.Optional[pathlib.Path],
     verbose: bool,
 ) -> None:
-    """Concatenate, fade, maybe NR, then emit queue/file outputs."""
+    """Concat, fade, NR then gain; emit segment to queue/file outputs."""
     if not segment_chunks:
         return
     full = np.concatenate(segment_chunks)
     full = apply_fade_in_out(full, sample_rate=audio_config.sample_rate)
-    full = apply_output_gain(full, gain_db=audio_config.gain_db)
     full = maybe_reduce_noise(
         full,
         enable=enable_noise_reduction,
@@ -590,6 +625,7 @@ def finalize_and_emit_vad_segment(
         sample_rate=audio_config.sample_rate,
         verbose=verbose,
     )
+    full = apply_output_gain(full, gain_db=audio_config.gain_db)
     emit_vad_segment_outputs(
         segment=full,
         sample_rate=audio_config.sample_rate,
@@ -606,4 +642,19 @@ def is_latency_ms_integer(
     sample_rate: int,
     buffer_size: int,
 ) -> bool:
-    return buffer_size % (sample_rate / 1000) == 0
+    # True if buffer_size frames correspond to an integer number of milliseconds
+    return (buffer_size * 1000) % sample_rate == 0
+
+
+def is_batch_multiple_of_buffer_ms(
+    *, batch_ms: int, sample_rate: int, buffer_size: int
+) -> bool:
+    """Return True if batch_ms is an integer multiple of buffer duration (ms)."""
+    # buffer_ms = buffer_size * 1000 / sample_rate
+    # batch_ms % buffer_ms == 0  -> (batch_ms * sample_rate) % (buffer_size * 1000) == 0
+    return (batch_ms * sample_rate) % (buffer_size * 1000) == 0
+
+
+def ms_to_buffer_frames(*, ms: int, sample_rate: int, buffer_size: int) -> int:
+    """Convert milliseconds to whole buffer frames count (floor)."""
+    return (ms * sample_rate) // (buffer_size * 1000)
